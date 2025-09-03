@@ -1,0 +1,8 @@
+user_intent: "Show me all rights deals for 2024."
+sql_text: "SELECT deal_id, year FROM rights WHERE year = 2024;"
+sql_result:
+  - deal_id: 1
+    year: 2024
+  - deal_id: 2
+    year: 2024
+generated_summary: "There are 2 rights deals found for 2024."
