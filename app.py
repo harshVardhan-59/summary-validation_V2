@@ -26,14 +26,19 @@ st.set_page_config(page_title="Summary Validator", layout="wide")
 st.title("📊 Summary Validator Dashboard")
 
 # User prompt input
-user_prompt = st.text_area("Enter your prompt to validate summary:", height=100)
+# User intent input
+user_intent = st.text_input("Enter the user intent (natural language query):")
+user_prompt = st.text_area("Enter the SQL/summary prompt to validate:", height=100)
 
 if st.button("Run Validation"):
-    if not user_prompt.strip():
+    if not user_intent.strip():
+        st.warning("⚠️ Please enter a user intent before running validation.")
+    elif not user_prompt.strip():
         st.warning("⚠️ Please enter a prompt before running validation.")
     else:
         try:
-            result = validator.run(user_prompt)
+            result = validator.run(user_prompt=user_prompt, user_intent=user_intent)
+
 
             # --- Forward Validation ---
             st.markdown("## 🔎 Forward Validation")

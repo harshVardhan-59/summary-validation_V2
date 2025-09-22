@@ -11,7 +11,7 @@ from summac.model_summac import SummaCZS
 from nltk import sent_tokenize
 from datetime import date
 from DatabaseConn import DatabaseConn
-
+ 
 # Configure logger
 logging.basicConfig(
     level=logging.INFO,
@@ -19,13 +19,13 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
-
+ 
 def normalize(text):
     """Lowercase and collapse spaces."""
     text = text.lower().strip()
     text = re.sub(r"\s+", " ", text)
     return text
-
+ 
 def clean_text(text):
     """Clean text for SummaC by removing special characters and extra formatting."""
     text = re.sub(r"[\n\t•-]", " ", text)  # Remove newlines, tabs, bullets
@@ -33,7 +33,7 @@ def clean_text(text):
     text = re.sub(r"[()[\]{}]", "", text)  # Remove parentheses, brackets
     text = text.strip()
     return text
-
+ 
 def extract_identifiers(text):
     """Extract identifiers, preserving phrases and handling special characters."""
     # Match numbers, dates (DD-MM-YYYY or YYYY-MM-DD), and phrases with spaces or special chars
@@ -48,7 +48,7 @@ def extract_identifiers(text):
                 match = f"{match[8:10]}-{match[5:7]}-{match[0:4]}"
             identifiers.append(normalize(match))
     return identifiers
-
+ 
 def json_to_text(data, prefix=""):
     """Recursively convert JSON to natural language text for any schema."""
     sentences = []
@@ -72,18 +72,22 @@ def json_to_text(data, prefix=""):
         key_name = prefix.replace("_", " ").replace(".", " ").title()
         sentences.append(f"{key_name} is {value_str}.")
     return sentences
-
+ 
 class GroundTruthGenerator:
     def __init__(self, sql_result):
         self.sql_result = sql_result
-
+ 
     def generate(self):
         count = len(self.sql_result) if isinstance(self.sql_result, list) else 1
         return f"The query returned {count} rights records."
-
+ 
 class ForwardValidator:
     def __init__(self):
-        logger.info("[ForwardValidator] Loading factual consistency model (SummaCZS with DeBERTa-MNLI backbone)...")
+        logger.info("[ForwardValidator] Loading factual consistency model (SummaCZS with RoBERTa-MNLI backbone)...")
+        self.summac = SummaCZS(granularity="sentence", model_name="mnli", device="cpu")
+        logger.info("[ForwardValidator] Loading embedding model (bge-large-en-v1.5)...")
+        self.bge = SentenceTransformer("BAAI/bge-large-en-v1.5")
+        logger.info("[ForwardValidator] Loading QA model (distilbert-base-cased-distilled-squad)...")
         device = "cpu"
         try:
             if torch.cuda.is_available():
@@ -93,28 +97,6 @@ class ForwardValidator:
             logger.info(f"[ForwardValidator] Using device: {device}")
         except Exception as e:
             logger.warning(f"[ForwardValidator] Failed to detect device: {e}. Defaulting to CPU.")
-        
-        # Initialize SummaCZS with a supported model (deberta-large-mnli)
-        try:
-            self.summac = SummaCZS(
-                granularity="sentence",
-                model_name="deberta-large-mnli",  # Changed from roberta-large-mnli
-                device=device,
-                tokenizer_kwargs={"truncation": True}  # Avoid deprecated truncation_strategy
-            )
-        except Exception as e:
-            logger.error(f"[ForwardValidator] Failed to load SummaCZS: {e}. Falling back to CPU.")
-            self.summac = SummaCZS(
-                granularity="sentence",
-                model_name="deberta-large-mnli",
-                device="cpu",
-                tokenizer_kwargs={"truncation": True}
-            )
-        
-        logger.info("[ForwardValidator] Loading embedding model (bge-large-en-v1.5)...")
-        self.bge = SentenceTransformer("BAAI/bge-large-en-v1.5")
-        
-        logger.info("[ForwardValidator] Loading QA model (distilbert-base-cased-distilled-squad)...")
         try:
             self.qa_pipeline = pipeline(
                 "question-answering",
@@ -125,7 +107,7 @@ class ForwardValidator:
         except Exception as e:
             logger.error(f"[ForwardValidator] Failed to load QA model: {e}")
             raise
-
+ 
     def sql_to_reference_text(self, sql_result):
         """Convert SQL result (JSON) to text dynamically, handling any schema."""
         if isinstance(sql_result, str):
@@ -138,7 +120,7 @@ class ForwardValidator:
         reference_text = "\n".join(lines)
         logger.info(f"[ForwardValidator] Generated reference text:\n{reference_text}")
         return reference_text
-
+ 
     def sql_to_summary_text(self, sql_result):
         """Generate a summarized reference text for factual consistency checking."""
         if not isinstance(sql_result, list):
@@ -179,212 +161,147 @@ class ForwardValidator:
         reference_text = "\n".join(sentences)
         logger.info(f"[ForwardValidator] Generated summary reference text:\n{reference_text}")
         return reference_text
-
-    def rule_based_check(self, summary, sql_response):
-        """
-        Dynamic rule-based factual consistency check as a fallback, avoiding hardcoding.
-        """
-        logger.info("[ForwardValidator] Performing dynamic rule-based factual consistency check...")
-
-        if not summary or not sql_response:
-            logger.warning("[ForwardValidator] Empty summary or SQL response; returning poor result")
-            return {"Result": "❌ Poor", "Confidence": 0.0, "Claims": []}
-
+ 
+    def rule_based_check(self, summary, sql_result):
+        """Rule-based check for dynamic fields."""
+        if not isinstance(sql_result, list):
+            sql_result = [sql_result]
+        issues = []
+        summary_identifiers = set(extract_identifiers(normalize(clean_text(summary))))
+        
+        # Define fields to check (ignore metadata)
+        key_fields = [
+            "title_id", "title_source_id", "program_name", "deal_id", "hive_deal_id",
+            "deal_name", "term_from", "term_to", "countries"
+        ]
+        for row in sql_result:
+            row_values = []
+            def collect_values(data, key=""):
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if k in key_fields or k == "media_types" or k == "brands":
+                            if k == "media_types":
+                                row_values.extend(list(v.keys()))
+                            else:
+                                collect_values(v, k)
+                elif isinstance(data, list):
+                    for v in data:
+                        collect_values(v, key)
+                else:
+                    if len(str(data)) > 2:
+                        if isinstance(data, date):
+                            data = data.strftime("%d-%m-%Y")
+                        elif isinstance(data, str) and re.match(r"\d{4}-\d{2}-\d{2}", data):
+                            data = f"{data[8:10]}-{data[5:7]}-{data[0:4]}"
+                        row_values.append(normalize(clean_text(str(data))))
+            collect_values(row)
+            
+            for value in row_values:
+                if value not in summary_identifiers:
+                    issues.append(f"Value mismatch: {value} not found in summary")
+        return issues
+ 
+    def extract_claims(self, summary):
+        """Split summary into factual claims, treating bullet points as separate claims."""
+        if not summary or not isinstance(summary, str) or len(summary.strip()) < 20:
+            logger.warning(f"[ForwardValidator] Invalid summary: {summary}; returning empty claims")
+            return []
+        # Split on newlines and clean each line
+        lines = [line.strip() for line in summary.split('\n') if line.strip() and not line.strip().startswith(('1.', '- List', 'Terms Summary:'))]
+        claims = []
+        claim_id = 1
+        for line in lines:
+            # Split sub-bullets (e.g., Primary rights sub-items)
+            if line.startswith('- '):
+                line = line[2:].strip()
+                if line.startswith(('Primary rights:', 'Ancillary rights:', 'Territories:', 'Brands:', 'Languages:', 'Notes:', 'Exclusivity:')):
+                    # Split sub-items under Primary rights, Ancillary rights, etc.
+                    sub_items = [item.strip() for item in line.split('\n') if item.strip() and not item.strip().startswith('- ')]
+                    for item in sub_items:
+                        if len(item.split()) >= 3:
+                            claims.append({"id": claim_id, "text": item})
+                            claim_id += 1
+                elif len(line.split()) >= 3:
+                    claims.append({"id": claim_id, "text": line})
+                    claim_id += 1
+            elif len(line.split()) >= 3:
+                claims.append({"id": claim_id, "text": line})
+                claim_id += 1
+        if not claims:
+            logger.warning(f"[ForwardValidator] No valid claims extracted from summary: {summary}")
+        else:
+            logger.info(f"[ForwardValidator] Extracted claims: {[c['text'] for c in claims]}")
+        return claims
+ 
+    def factual_consistency(self, summary, reference):
+        """Check factual consistency with SummaC, handling edge cases."""
+        if not summary or not isinstance(summary, str) or len(summary.strip()) < 20:
+            logger.warning(f"[ForwardValidator] Empty or invalid summary: {summary}; returning score 0.0")
+            return {"score": 0.0, "details": []}
+        if not reference:
+            logger.warning("[ForwardValidator] Empty reference data; returning score 0.0")
+            return {"score": 0.0, "details": []}
+ 
+        reference_text = self.sql_to_summary_text(reference)
+        reference_norm = normalize(clean_text(reference_text))
+        summary_norm = normalize(clean_text(summary))
         claims = self.extract_claims(summary)
         if not claims:
-            logger.warning("[ForwardValidator] No claims extracted from summary")
-            return {"Result": "❌ Poor", "Confidence": 0.0, "Claims": []}
-
-        if not isinstance(sql_response, list) or not sql_response:
-            logger.warning("[ForwardValidator] Invalid SQL response format")
-            return {"Result": "❌ Poor", "Confidence": 0.0, "Claims": []}
-        sql_data = sql_response[0]
-
-        claim_results = []
-        scores = []
-
-        for idx, claim in enumerate(claims, 1):
-            claim_lower = claim["text"].lower()
-            score = 0.0
-            verdict = "inaccurate"
-            matched = False
-
-            try:
-                # Title count claim
-                if "total matching title count" in claim_lower:
-                    expected = str(sql_data.get("total_title_count", 0))
-                    if expected in claim["text"]:
-                        score = 1.0
-                        matched = True
-
-                # Title selected claim
-                elif "title selected" in claim_lower:
-                    program_name = sql_data.get("program_name", "").lower()
-                    title_source_id = str(sql_data.get("title_source_id", "")).replace(".0", "")
-                    title_source = sql_data.get("title_source", "").lower()
-                    if program_name in claim_lower and title_source_id in claim["text"] and title_source in claim_lower:
-                        score = 1.0
-                        matched = True
-
-                # Deal claim (general for any deal name)
-                elif "commission" in claim_lower or "deal" in claim_lower:
-                    deal_name = sql_data.get("deal_name", "").lower()
-                    deal_id = str(sql_data.get("deal_id", "")).replace(".0", "")
-                    hive_deal_id = str(sql_data.get("hive_deal_id", "")).replace(".0", "")
-                    primary_parties = [p.lower() for p in sql_data.get("deal_primary_parties", [])]
-                    if deal_name in claim_lower and deal_id in claim["text"] and hive_deal_id in claim["text"] and all(p in claim_lower for p in primary_parties[:2]):
-                        score = 1.0
-                        matched = True
-
-                # Primary rights claim (e.g., "Pay TV: Yes")
-                elif ": yes" in claim_lower and any(right in claim_lower for right in ["pay tv", "free tv", "ppv", "fast", "tvod", "stb vod", "svod", "download to own"]):
-                    right_name = re.search(r"([a-z\s]+):\s*yes", claim_lower, re.IGNORECASE)
-                    if right_name:
-                        right_key = right_name.group(1).strip().title()
-                        if right_key.lower() in [k.lower() for k in sql_data.get("media_types", {}).keys()]:
-                            score = 1.0
-                            matched = True
-
-                # Ancillary rights claim (e.g., "Simulcast: FAST (Yes)")
-                elif ": yes" in claim_lower and " (" in claim_lower:
-                    ancillary_match = re.match(r"(\w+\s*(?:\w+\s*)*):\s*(\w+\s*(?:\w+\s*)*)\s*\(Yes\)", claim["text"], re.IGNORECASE)
-                    if ancillary_match:
-                        right = ancillary_match.group(1).title()
-                        mt = ancillary_match.group(2).title()
-                        attrs = sql_data.get("media_types", {}).get(mt, {})
-                        if right.lower() in attrs and attrs[right.lower()] == True:
-                            score = 1.0
-                            matched = True
-
-                # Territories claim
-                elif "territories" in claim_lower:
-                    if sql_data.get("countries", "").lower() == "world wide" and "world wide" in claim_lower:
-                        score = 1.0
-                        matched = True
-
-                # Brands claim
-                elif "brands" in claim_lower:
-                    brands = sql_data.get("brands", [])
-                    if any(brand.lower() in claim_lower for brand in brands[:10]):  # Check at least some brands
-                        score = 1.0
-                        matched = True
-
-                # Languages claim
-                elif "languages" in claim_lower:
-                    if "all languages" in claim_lower and all("All Languages" in sql_data.get("media_types", {}).get(mt, {}).get("Allowed Languages", []) for mt in sql_data.get("media_types", {}).keys()):
-                        score = 1.0
-                        matched = True
-
-                # Earliest term_from date claim
-                elif "earliest term_from date" in claim_lower:
-                    term_from = sql_data.get("term_from", "").replace("-", "")
-                    if term_from in claim["text"].replace("-", ""):
-                        score = 1.0
-                        matched = True
-
-                # Latest term_to date claim
-                elif "latest term_to date" in claim_lower:
-                    term_to = sql_data.get("term_to", "").replace("-", "")
-                    if term_to in claim["text"].replace("-", ""):
-                        score = 1.0
-                        matched = True
-
-                # No overlaps or gaps in term windows claim
-                elif "no overlaps or gaps" in claim_lower:
-                    if not sql_data.get("estimated_term_from", True) and not sql_data.get("estimated_term_to", True):
-                        score = 1.0
-                        matched = True
-
-            except Exception as e:
-                logger.warning(f"[ForwardValidator] Error validating claim '{claim}': {e}")
-
-            if not matched:
-                logger.warning(f"[ForwardValidator] No validation rule matched for claim: {claim}")
-
-            claim_results.append({
-                "claim_id": idx,
-                "sentence": claim["text"],
-                "score": score,
-                "verdict": "accurate" if score > 0.5 else "inaccurate"
-            })
-            scores.append(score)
-
-        confidence = sum(scores) / len(scores) if scores else 0.0
-        result = "✅ Good" if confidence >= 0.8 else "⚠️ Moderate" if confidence >= 0.5 else "❌ Poor"
-
-        logger.info(f"[ForwardValidator] Rule-based factual consistency: confidence={confidence}, result={result}")
-
-        return {
-            "Result": result,
-            "Confidence": round(confidence, 2),
-            "Claims": claim_results
-        }
-
-    def extract_claims(self, summary):
-        sentences = sent_tokenize(summary)
-        claims = []
-        for s in sentences:
-            if any(keyword in s.lower() for keyword in [
-                "total matching title count", "title selected", "deal", "commission",
-                ": yes", "territories", "brands", "languages", "term_from", "term_to", "no overlaps"
-            ]):
-                claims.append({"text": s.strip()})
-        return claims
-
-    def factual_consistency(self, summary, reference):
-        """
-        Check factual consistency using SummaCZS, with dynamic rule-based check as fallback.
-        """
-        logger.info("[ForwardValidator] Checking factual consistency with SummaCZS...")
-        if not summary or not reference:
-            logger.warning("[ForwardValidator] Empty summary or reference; returning poor result")
-            return {"Result": "❌ Poor", "Confidence": 0.0, "Claims": []}
-
+            logger.warning("[ForwardValidator] No valid claims extracted; returning score 0.0")
+            return {"score": 0.0, "details": []}
+ 
+        summary_sentences = [clean_text(c["text"]) for c in claims]
+        logger.info(f"[ForwardValidator] SummaC input - Reference: {reference_norm[:500]}...")
+        logger.info(f"[ForwardValidator] SummaC input - Summary sentences: {summary_sentences}")
+        
         try:
-            summary_sentences = sent_tokenize(summary)
-            reference_sentences = sent_tokenize(reference)
-            if not summary_sentences or not reference_sentences:
-                logger.warning("[ForwardValidator] No sentences extracted; returning poor result")
-                return {"Result": "❌ Poor", "Confidence": 0.0, "Claims": []}
-
-            # Run SummaCZS
-            summac_score = self.summac.score(
-                originals=reference_sentences,
-                generated=summary_sentences
-            )
-            logger.info(f"[ForwardValidator] SummaCZS score: {summac_score}")
-
-            # Extract claims from summary
-            claims = self.extract_claims(summary)
-            if not claims:
-                logger.warning("[ForwardValidator] No claims extracted from summary")
-                return {"Result": "❌ Poor", "Confidence": 0.0, "Claims": []}
-
-            # Map scores to claims
-            claim_results = []
-            scores = summac_score["scores"]
-            for idx, (claim, score) in enumerate(zip(claims, scores[:len(claims)]), 1):
-                verdict = "accurate" if score >= 0.5 else "inaccurate"
-                claim_results.append({
-                    "claim_id": idx,
-                    "sentence": claim["text"],
-                    "score": round(score, 2),
-                    "verdict": verdict
-                })
-
-            # Calculate overall result
-            confidence = sum(scores[:len(claims)]) / len(claims) if claims else 0.0
-            result = "✅ Good" if confidence >= 0.8 else "⚠️ Moderate" if confidence >= 0.5 else "❌ Poor"
-
-            return {
-                "Result": result,
-                "Confidence": round(confidence, 2),
-                "Claims": claim_results
-            }
+            scores = self.summac.score([reference_norm] * len(summary_sentences), summary_sentences, return_sent_scores=True)
+            logger.info(f"[ForwardValidator] SummaC scores: {json.dumps(scores, indent=2, default=str)}")
         except Exception as e:
-            logger.error(f"[ForwardValidator] SummaCZS failed: {e}. Falling back to rule-based check.")
-            return self.rule_based_check(summary, reference)
-
+            logger.error(f"[ForwardValidator] SummaC failed: {e}")
+            return {"score": 0.0, "details": [{"claim_id": c["id"], "sentence": c["text"], "score": 0.0, "verdict": "inaccurate"} for c in claims]}
+ 
+        raw_score = float(scores.get("scores", [0.0])[0])
+        normalized_score = (raw_score + 1) / 2
+        logger.info(f"[ForwardValidator] SummaC raw: {raw_score}, normalized: {normalized_score}")
+ 
+        details = []
+        if "details" not in scores or not scores["details"] or not scores["details"][0]:
+            logger.warning(f"[ForwardValidator] SummaC returned no details for summary; trying paragraph granularity")
+            # Try paragraph granularity as fallback
+            try:
+                self.summac.granularity = "paragraph"
+                scores = self.summac.score([reference_norm] * len(summary_sentences), summary_sentences, return_sent_scores=True)
+                self.summac.granularity = "sentence"  # Reset to sentence
+                logger.info(f"[ForwardValidator] Paragraph granularity scores: {json.dumps(scores, indent=2, default=str)}")
+            except Exception as e:
+                logger.error(f"[ForwardValidator] SummaC paragraph granularity failed: {e}")
+                return {"score": 0.0, "details": [{"claim_id": c["id"], "sentence": c["text"], "score": 0.0, "verdict": "inaccurate"} for c in claims]}
+        
+        if "details" in scores and scores["details"] and scores["details"][0]:
+            for detail in scores["details"][0]:
+                logger.info(f"[ForwardValidator] Sentence: {detail['sent']} | Score: {detail['score']:.3f}")
+            details = [
+                {
+                    "claim_id": c["id"],
+                    "sentence": c["text"],
+                    "score": d["score"],
+                    "verdict": "accurate" if d["score"] > 0.9 else "partial" if d["score"] > 0.7 else "inaccurate"
+                }
+                for c, d in zip(claims, scores["details"][0])
+            ]
+        else:
+            logger.warning(f"[ForwardValidator] SummaC still returned no details for summary: {summary}")
+            details = [{"claim_id": c["id"], "sentence": c["text"], "score": 0.0, "verdict": "inaccurate"} for c in claims]
+ 
+        issues = self.rule_based_check(summary, reference)
+        if issues:
+            logger.info(f"[ForwardValidator] Rule-based issues: {issues}")
+            normalized_score *= 0.8
+            logger.info(f"[ForwardValidator] Score penalized: {normalized_score}")
+ 
+        return {"score": normalized_score, "details": details}
+ 
     def intent_alignment(self, summary, user_intent):
         if not summary or not user_intent or not isinstance(summary, str) or not isinstance(user_intent, str):
             logger.warning("[ForwardValidator] Empty or invalid summary/user_intent; returning score 0.0")
@@ -400,56 +317,63 @@ class ForwardValidator:
         if has_overlap:
             score = max(score, 0.85)
         return score
-
+ 
     def answerability(self, summary, questions):
-        """
-        Perform QA on the summary to evaluate answerability. (Unchanged)
-        """
         if not summary or not isinstance(summary, str):
             logger.warning("[ForwardValidator] Empty or invalid summary; returning empty answerability results")
             return {"average_score": 0.0}
-
+ 
         logger.info(f"[ForwardValidator] Original generated_summary: {summary}")
         summary_clean = self.flatten_summary_for_qa(summary)
-
+ 
         qa_results = {}
         scores = []
-
+ 
         for question in questions:
+            # Clean question grammar
             question_clean = re.sub(r"\bhas\b", "have", question)
-            question_clean = question_clean.strip("?") + "?"
+            question_clean = question_clean.strip("?") + "?"  # Ensure consistent question format
             try:
+                # Run QA pipeline with adjusted parameters to improve score
                 result = self.qa_pipeline(
                     question=question_clean,
                     context=summary_clean,
-                    max_answer_len=30,
-                    top_k=1
+                    max_answer_len=30,  # Limit answer length to focus on specific terms
+                    top_k=1  # Return only the top answer
                 )
                 answer_text = result["answer"].replace("\n", " ").strip()
                 score = float(result["score"])
                 logger.info(f"[ForwardValidator] QA result for '{question_clean}': answer='{answer_text}', score={score}")
-
+ 
+                # Post-process for yes/no questions
                 if "does" in question_clean.lower() and "include" in question_clean.lower():
+                    # Extract media type from question (e.g., "Pay TV")
                     media_type_match = re.search(r"include\s+([A-Za-z\s]+?)\s+as\s+a\s+primary\s+right", question_clean, re.IGNORECASE)
                     if media_type_match:
                         media_type = media_type_match.group(1).strip().lower()
+                        # Check if media type is in the answer or context
                         if media_type in answer_text.lower() or media_type in summary_clean.lower():
                             answer_text = "Yes"
-                            score = max(score, 0.8)
+                            # Boost score for clear matches in context
+                            if media_type in summary_clean.lower():
+                                score = max(score, 0.8)  # Artificially boost score if context clearly supports
                         elif "none" in answer_text.lower() or not answer_text:
                             answer_text = "No"
                         else:
                             answer_text = "Information not available in summary"
                     else:
+                        # Fallback for generic yes/no questions
                         media_types = ["pay tv", "free tv", "ppv", "fast", "tvod", "stb vod", "svod", "download to own"]
                         if any(right.lower() in answer_text.lower() for right in media_types):
                             answer_text = "Yes"
-                            score = max(score, 0.8)
+                            # Boost score if any media type is found
+                            if any(right.lower() in summary_clean.lower() for right in media_types):
+                                score = max(score, 0.8)
                         elif "none" in answer_text.lower() or not answer_text:
                             answer_text = "No"
                         else:
                             answer_text = "Information not available in summary"
-
+ 
                 if not answer_text or answer_text.lower() in ["none", "not found"] or "incorporated deal" in answer_text.lower():
                     answer_text = "Information not available in summary"
                 qa_results[question] = {"answer": answer_text, "score": round(score, 2)}
@@ -458,16 +382,16 @@ class ForwardValidator:
                 logger.error(f"[ForwardValidator] QA failed for '{question}': {e}")
                 qa_results[question] = {"answer": "Error", "score": 0.0}
                 scores.append(0.0)
-
+ 
         qa_results["average_score"] = round(sum(scores) / len(scores), 2) if scores else 0.0
         return qa_results
-
+ 
     def flatten_summary_for_qa(self, summary):
         """Flatten the generated summary into short QA-friendly sentences."""
         if not summary or not isinstance(summary, str):
             logger.warning("[ForwardValidator] Empty or invalid summary; returning empty string")
             return ""
-
+ 
         # Replace placeholder dates
         summary = re.sub(r"\b12-31-9999\b", "Not specified", summary)
         # Remove bullets, indentation, tabs
@@ -481,7 +405,7 @@ class ForwardValidator:
         in_ancillary_rights_section = False
         primary_rights = []
         ancillary_rights = []
-
+ 
         for line in lines:
             # Detect section transitions
             if "List of incorporated Deals:" in line:
@@ -503,7 +427,7 @@ class ForwardValidator:
                 in_deals_section = False
                 in_primary_rights_section = False
                 in_ancillary_rights_section = False
-
+ 
             # Count deals in deals section
             if in_deals_section and line.startswith("  "):
                 deal_count += 1
@@ -545,36 +469,36 @@ class ForwardValidator:
                 flat_sentences.append(line.strip() + ".")
             elif line.startswith("Latest term_to date:"):
                 flat_sentences.append(line.strip() + ".")
-
+ 
         # Add deal count if detected
         if deal_count > 0:
             flat_sentences.insert(0, f"Property has {deal_count} incorporated deal(s).")
-
+ 
         # Add primary rights
         if primary_rights:
             flat_sentences.append(f"Primary rights include: {', '.join(primary_rights)}.")
         else:
             flat_sentences.append("Primary rights: None specified.")
-
+ 
         # Add ancillary rights
         if ancillary_rights:
             flat_sentences.append(f"Ancillary rights include: {', '.join(ancillary_rights)}.")
         else:
             flat_sentences.append("Ancillary rights: None specified.")
-
+ 
         flat_summary = " ".join(flat_sentences)
         flat_summary = re.sub(r"\s+", " ", flat_summary)
         logger.info(f"[ForwardValidator] Flattened summary for QA: {flat_summary}")
         return flat_summary.strip()
-
-
+ 
+ 
 class InputProvider:
     def __init__(self, config, api_url=None):
         self.config = config
         self.api_url = api_url
         self._api_cache = None
         self.last_sources = {}
-
+ 
     def fetch_api_response(self):
         if self._api_cache is not None:
             return self._api_cache
@@ -594,7 +518,7 @@ class InputProvider:
             logger.error(f"[InputProvider] Failed to fetch API response: {e}")
             self._api_cache = {}
         return self._api_cache
-
+ 
     def get_value(self, key, override_value=None, api_data=None):
         if override_value is not None:
             self.last_sources[key] = "UserInput"
@@ -636,10 +560,10 @@ class InputProvider:
             )
             logger.info(f"[InputProvider] {key} -> {results[key]} (source={self.last_sources[key]})")
         return results
-
+ 
     def get_sources(self):
         return self.last_sources
-
+ 
 class SummaryValidator:
     def __init__(self, db_conn, config_path="config.yaml", api_url=None):
         self.db_conn = db_conn
@@ -649,7 +573,7 @@ class SummaryValidator:
         self.forward = ForwardValidator()
         self.num_questions = self.input_provider.get_value("num_questions") or 5
         self.thresholds = self.input_provider.get_value("thresholds") or {"good": 0.8, "moderate": 0.6}
-
+ 
     def status(self, score):
         if score >= self.thresholds["good"]:
             return "✅ Good"
@@ -657,7 +581,7 @@ class SummaryValidator:
             return "⚠️ Moderate"
         else:
             return "❌ Poor"
-
+ 
     def interpret_results(self, raw_results):
         answerability = raw_results["forward_validation"]["answerability"]
         questions = [q for q in answerability.keys() if q != "average_score"]
@@ -686,20 +610,23 @@ class SummaryValidator:
                 }
             }
         }
-
-    def run(self, user_prompt=None):
+ 
+    def run(self, user_prompt=None, user_intent=None):
         keys = ["user_intent", "sql_result", "ground_truth", "questions", "sql_text", "generated_summary"]
         inputs = self.input_provider.get_all(keys, prompt=user_prompt)
+        # Override config.yaml value if passed via UI
+        if user_intent:
+            inputs["user_intent"] = user_intent
         logger.info(f"[Validator] User intent: {inputs['user_intent']}")
         logger.info(f"[Validator] Questions: {inputs.get('questions')}")
         logger.info(f"[Validator] sql_text: {inputs.get('sql_text')}")
         logger.info(f"[Validator] generated_summary: {inputs.get('generated_summary')}")
-
+ 
         sql_text = inputs.get("sql_text", "")
         if not sql_text or not isinstance(sql_text, str):
             logger.error("[Validator] No valid sql_text provided; cannot fetch sql_result")
             raise ValueError("sql_text is required and must be a valid string")
-
+ 
         logger.info(f"[Validator] SQL query to execute:\n{sql_text}")
         try:
             sql_result = self.db_conn.execute_sql(sql_text, session_id="summary_validation")
@@ -707,27 +634,27 @@ class SummaryValidator:
         except Exception as e:
             logger.error(f"[Validator] Failed to execute SQL: {e}")
             raise
-
+ 
         generated_summary = inputs.get("generated_summary", "")
         if not generated_summary or not isinstance(generated_summary, str) or len(generated_summary.strip()) < 20:
             logger.warning(f"[Validator] Invalid generated_summary: {generated_summary}; using empty string")
             generated_summary = ""
-
+ 
         questions = inputs.get("questions", [])
-
+ 
         forward_results = {
             "factual_consistency": self.forward.factual_consistency(generated_summary, sql_result),
             "intent_alignment": self.forward.intent_alignment(generated_summary, inputs["user_intent"]),
             "answerability": self.forward.answerability(generated_summary, questions),
         }
-
+ 
         raw_results = {
             "data_source": "UserInput" if user_prompt else "API",
             "forward_validation": forward_results,
         }
-
+ 
         return self.interpret_results(raw_results)
-
+ 
 if __name__ == "__main__":
     with open("config.yaml", "r") as f:
         config = yaml.safe_load(f)
@@ -747,5 +674,7 @@ if __name__ == "__main__":
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False, default=str)
     print(f"\nValidation results saved to: {output_path.resolve()}")
-
-
+ 
+ 
+ 
+ 
